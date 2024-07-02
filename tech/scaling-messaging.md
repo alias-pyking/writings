@@ -1,47 +1,96 @@
 # A year of scaling a messaging service at a Startup
 
->If you don't me already, I work at a small startup Limechat. <br>
+>If you don't know me already, I work at a small startup Limechat. <br>
 > We are building E-commerce on Chat.
 
 The word chat in this context means anything that can be done via messages will be done via messages. To deal with these messages we have built a service that facilitates the sending of messages and receiving status updates and incoming messages from the users.
 
-These are just short anecdotes of how we went through it, it may help you in future.
+I want to break this post down into two parts
+ - Scaling Challenges in Sending messages.
+ - Scaling Challenges in Webhooks system.
+
+<br>
+
+> A webhook is an api request sent to us by whatsapp when a message is sent, delivered, read or failed. We use these webhooks to update the status of the message in our database and to relay this information to our internal systems like CRM, Bot etc.
 
 
-**First principles coding** <br>
-While writing the code for the service we just focused on the first principles didn't think too much about optimizations. We were majorly focused on only writing clean code. Every function should be highly cohesive, code should be decoupled, we focused on building the top level interfaces required by this service and these interfaces should be segregated enough that if we had to let's say add new integration (currently we support whatsapp only) let's say instagram we didn't have to touch any existing file for the most part. 
+## Scaling Challenges in Sending messages
+We have an API that supports sending two types of messages, a message can be sent one by one or a single messages
+can be sent in bulk to multiple users fecilitating things like broadcast on whatsapp.
 
-Sending of messages and processing of status updates via webhooks and then further sending those webhooks downstream to other services , all of this involves network IO, we rarely do any CPU bound operation here, so we chose NodeJS to power the backend of this service.
+You could aruge that just sending one by one would also have easily fecilitated the broadcast where the client can
+just use that API multiple times but that would have been an inefficient design, we are wasting network resources
+of the client and our server as well and on top of it client should also be scalable enough to send hundereds of thousands of API calls in a short span of time.
 
+Our API looks something like this
 
-**Idempotency & Queuing systems**
-
-This messaging service also supports sending of messages in bulk, a client can send as many as 500K messages at once using this bulk API.
-
-Our first principles got us to the place where we were easily able to handle around 50k bulk messages with little to no issues even 100k wasn't a problem but we could see issues occurring with multiple client doing bulk API calls with 100k messages.
-
-Example bulk API
+**Example bulk API**
 
 `api/v1/messages`
 
 parameters:
  - type: [bulk, normal] default: normal
+
 body:
-  - file_url: A CSV file contains list of phone numbers
+  - fileURL: A CSV file contains list of phone numbers
+  message: A JSON object containing the message content
 
-Processing 500k phone numbers synchronously is not an option, so when we receive the bulk request we create an object in the database attaching the file_url and queue a job in the background using bullmq to process the CSV and send messages.
+Code for this is pretty simple
+```js
 
->**📢 Quick refresher on pub-sub**
-A pub sub system consists of three components a publisher, subscriber and a broker. Publisher publishes the messages(don't confuse it with message we send to user on whatsapp) broker takes this messages and delivers it to the subscribers. This mechanism in our case is powered by bullmq that uses redis as a broker.
+async function sendMessageApi(request, reply) {
 
-Basic property of these queuing systems 
- - At least once delivery
+	const { type, fileURL, messageContent} = request.body;
+	const job = Jobs.create({ type, fileURL, data });
+	if (type === 'bulk') {
+		await addJobToQueue('messages:bulk', 'send_bulk_messages', job.id);
+	} else {
+		await addJobToQueue('messages', 'send_message', job.id);
+	}
+	reply.send({ok: true});
+}
+
+
+async function sendMessageJob(jobId) {
+	const job = await Jobs.findById(jobId);
+	const { phone, message } = job.data;	
+	// api call to whatsapp
+}
+
+async function sendBulkMessagesJob(jobId) {
+	const jobData = await Jobs.findById(jobId);
+	if (!jobData){
+		logger.error('Job not found, id: %', jobId);
+		return;
+	}
+	const phones = await fetchPhones(jobData.fileURL);
+	phones.forEach(async function(phone){
+		await sendMessageJob(phone, jobData.messageContent);
+	});
+}
+```
+ - We are using bullMQ for queuing the jobs in the background.
+ - We are not sending the messages synchronously as it can overwhelm the main server.
+ - Also our bulk API supports sending of 500k messages in a single request which would take a lot of time to process synchronously.
+
+
+This would easily scale & we still have no problem with this type of architecture for single messages, but for bulk messages there is a lot of scope for improvement.
+
+>**📢 Quick refresher on background processing** <br>
+In web servers, synchronous processing handles requests and responds immediately, like Instagram's post API. However, APIs that require extensive processing, such as YouTube's video upload API, can't be handled this way.<br>
+Background processing queues jobs and sends an "accepted" response to the client. The job is processed asynchronously, and the client may check its status later if the server provides an API for this purpose. This approach often uses distributed messaging queues like RabbitMQ, Kafka, or BullMQ. <br>
+We're using BullMQ to do the same for our send message API.
+
+
+Every Messaging Queue(MQ) out there have a basic property.
+ - Atleast once delivery.
+ - Even though bullmq promises exactly once delivery but that too fails and in the worst case give at least once delivery.
 
 Meaning when we queue a job in the background messaging queue(MQ or bullMQ) promises it to be delivered at least once. If for some reason it doesn't receives acknowledgement from the consumer(subscriber) that it has received the message or it has processed the message, MQ will re-deliver this message. Now if our consumer is not idempotent this re-delivery can cause a disastrous effect which it did in our case.
 
 ```js
 
-async function processBulkJob(jobId: string): Promise<void> {
+async function sendBulkMessagesJob(jobId: string): Promise<void> {
 
 	const jobData = await Jobs.findById(jobId);
 	if (!jobData){
@@ -55,7 +104,7 @@ async function processBulkJob(jobId: string): Promise<void> {
 }
 ```
 
-`processBulkJob` function is called for each job that is queued when a bulk API call is received. Its working is pretty simple
+`sendBulkMessagesJob` function is called for each job that is queued when a bulk API call is received. Its working is pretty simple
  - Find the job in database.
  - Fetch phone numbers from CSV URL
  - send message to each phone number.
@@ -67,19 +116,19 @@ The more the phone numbers, more are the chances of this problem to occur as lar
 First thing we can do to solve this is configuring bigger timeout for this job.
 
 ```js
-await addJobToQueue('messages:bulk', 'process_bulk_job', data, { timeout: 300 }) // 300 seconds
+await addJobToQueue('messages:bulk', 'send_bulk_messages', data, { timeout: 300 }) // 300 seconds
 ```
 
 But this only solves for the timeout re-delivery problem that too assuming it finishes under 300 seconds.
-If for some reason re-delivery happened after 300 seconds we will still sitting ducks.
+If for some reason re-delivery happened after 300 seconds we will still be sitting ducks.
 
 **Idempotency**
 An operation is idempotent if it has the same result no matter how many times it's applied.
 
-To make our processing idempotency we can introduce a parameter in our jobData document or relation `isProcessed`, we will mark this value as `true` once all the messages are sent and at the start of process job we will check if this value is true or false if it's true we will terminate the job.
+To make our sendBulkMessagesJob idempotent we can introduce a parameter in our jobData document or relation `isProcessed`, we will mark this value as `true` once all the messages are sent and at the start of job we will check if this value is true or false if it's true we will terminate the job.
 
 ```js
-async function processBulkJob(jobId: string): Promise<void> {
+async function sendBulkMessagesJob(jobId: string): Promise<void> {
 	const jobData = await Jobs.findById(jobId);
 	if (!jobData){
 		logger.error('Job not found, id: %', jobId);
@@ -106,10 +155,10 @@ Okay so now we have solved re-delivery problem with timeout and idempotency, but
 -> Queue-->processing--fetch_phones--sending-----sending------------>completed <br>
 ->------------------------re-delivery-->processing--fetch_phones-- <br>
 
-As you can see, I have tried to demonstrate in above sorta visual. As processing of this job takes a lot of time... re-delivery can happen in the middle the execution of this job as well. To solve this issue we need to make sure that at a time there is only execution processBulkJob happening, we can introduce locks to solve for it. We can employ redis to handle the locking part.
+As you can see, I have tried to demonstrate in above sorta visual. As processing of this job takes a lot of time... re-delivery can happen in the middle the execution of this job as well. To solve this issue we need to make sure that at a time there is only execution sendBulkMessagesJob happening, we can introduce locks to solve for it. We can employ redis to handle the locking part.
 
 ```js
-async function processBulkJob(jobId: string): Promise<void> {
+async function sendBulkMessagesJob(jobId: string): Promise<void> {
 	const lockHash = 'lock:bulk:' + jobId;
 	try {	
 		await redisLock(lockHash, 300); // lock for 300 seconds
@@ -138,8 +187,7 @@ With this we finally would be able to avoid all the problems of re-delivery, the
 
 To solve for these rare cases though you can employ the idempotency at sendMessage level as well and only allow sending the messages that are still in pending state, as you will be updating the message status on each successful api call. <br>
 
-
-**Beginner's guide to webhooks system**
+## Beginner's guide to webhooks system 
 
 A webhook is a way of communicating b/w servers. There are two server one is a publisher server that obviously publishes the messages and other is a subscriber server that subscribes to the webhooks.
 
